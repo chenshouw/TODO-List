@@ -1,0 +1,42 @@
+# Python compiled bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+*.pkg
+
+# SQLite database (local user data)
+data/todos.db
+
+# Virtual environment
+venv/
+env/
+*.egg-info/
+.eggs/
+
+# Editor directories
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Backup files
+*.bak
+*.backup
+
+# Node modules (if any)
+node_modules/
