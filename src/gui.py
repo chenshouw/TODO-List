@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 图形界面模块
 使用 PyQt5 构建 TODO-List 桌面控件，提供简洁美观的交互界面。
@@ -35,6 +35,11 @@ from .storage import TodoStorage
 FILTER_ALL = "all"
 FILTER_ACTIVE = "active"
 FILTER_DONE = "done"
+
+# 分组模式常量，用于控制任务列表分组方式
+GROUP_NONE = "none"
+GROUP_BY_DATE = "by_date"
+GROUP_BY_MONTH = "by_month"
 
 
 class TodoItemWidget(QFrame):
@@ -196,6 +201,53 @@ class TodoItemWidget(QFrame):
         super(TodoItemWidget, self).mouseDoubleClickEvent(event)
 
 
+class GroupHeaderWidget(QFrame):
+    """
+    分组标题控件，用于在任务列表中显示日期或月份分组。
+
+    显示分组名称（如"今天"、"昨天"、"2026年6月"）和该组的任务数量。
+    """
+
+    def __init__(self, title, count, parent=None):
+        """
+        初始化分组标题控件。
+
+        Parameters
+        ----------
+        title : str
+            分组显示标题，如"今天"、"2026年6月"。
+        count : int
+            该分组下的任务数量。
+        parent : QWidget, optional
+            父对象，用于 Qt 对象树管理。
+        """
+        super(GroupHeaderWidget, self).__init__(parent)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setStyleSheet(
+            """
+            GroupHeaderWidget {
+                background-color: transparent;
+            }
+            """
+        )
+
+        root_layout = QHBoxLayout(self)
+        root_layout.setContentsMargins(14, 6, 14, 4)
+        root_layout.setSpacing(10)
+
+        self.title_label = QLabel(title)
+        self.title_label.setStyleSheet(
+            "color: #5e60ce; font-size: 13px; font-weight: 600;"
+        )
+        root_layout.addWidget(self.title_label, 1)
+
+        self.count_label = QLabel("({0})".format(count))
+        self.count_label.setStyleSheet(
+            "color: #9ca3af; font-size: 12px;"
+        )
+        root_layout.addWidget(self.count_label, 0)
+
+
 class TodoMainWindow(QMainWindow):
     """
     TODO-List 主窗口。
@@ -217,6 +269,7 @@ class TodoMainWindow(QMainWindow):
         self.storage = storage if storage else TodoStorage()
         self.todos = []
         self.current_filter = FILTER_ALL
+        self.current_group = GROUP_NONE
 
         self.setWindowTitle("我的待办清单")
         self.resize(480, 620)
@@ -289,7 +342,20 @@ class TodoMainWindow(QMainWindow):
         filter_container.addWidget(self.btn_all)
         filter_container.addWidget(self.btn_active)
         filter_container.addWidget(self.btn_done)
+
         filter_container.addStretch(1)
+
+        # 分组切换按钮
+        self.group_group = QButtonGroup(self)
+        self.group_group.setExclusive(True)
+
+        self.btn_group_none = self._create_group_button("不分", GROUP_NONE, True)
+        self.btn_group_date = self._create_group_button("按日期", GROUP_BY_DATE, False)
+        self.btn_group_month = self._create_group_button("按月份", GROUP_BY_MONTH, False)
+
+        filter_container.addWidget(self.btn_group_none)
+        filter_container.addWidget(self.btn_group_date)
+        filter_container.addWidget(self.btn_group_month)
 
         layout.addLayout(filter_container)
 
@@ -404,6 +470,34 @@ class TodoMainWindow(QMainWindow):
         self.filter_group.addButton(btn)
         return btn
 
+    def _create_group_button(self, text, mode, checked=False):
+        """
+        创建分组切换按钮，并加入到按钮组中。
+
+        Parameters
+        ----------
+        text : str
+            按钮显示文本。
+        mode : str
+            对应分组模式常量。
+        checked : bool, optional
+            初始是否选中。
+
+        Returns
+        -------
+        QPushButton
+            创建完成的按钮实例。
+        """
+        btn = QPushButton(text)
+        btn.setCheckable(True)
+        btn.setChecked(checked)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setProperty("group_mode", mode)
+        btn.setMinimumHeight(30)
+        btn.clicked.connect(lambda _=False, m=mode: self._handle_group_changed(m))
+        self.group_group.addButton(btn)
+        return btn
+
     def _apply_style(self):
         """
         应用全局样式表，为窗口、输入框、按钮等设置统一的现代外观。
@@ -467,6 +561,29 @@ class TodoMainWindow(QMainWindow):
                 border-color: #5e60ce;
                 color: #5e60ce;
             }
+            QPushButton[group_mode="none"]:checked,
+            QPushButton[group_mode="by_date"]:checked,
+            QPushButton[group_mode="by_month"]:checked {
+                background-color: #10b981;
+                color: white;
+                border: 1px solid #10b981;
+            }
+            QPushButton[group_mode="none"],
+            QPushButton[group_mode="by_date"],
+            QPushButton[group_mode="by_month"] {
+                background-color: #ffffff;
+                color: #374151;
+                border: 1px solid #d1d5db;
+                padding: 4px 12px;
+                border-radius: 14px;
+                font-size: 12px;
+            }
+            QPushButton[group_mode="none"]:hover,
+            QPushButton[group_mode="by_date"]:hover,
+            QPushButton[group_mode="by_month"]:hover {
+                border-color: #10b981;
+                color: #10b981;
+            }
             QCheckBox::indicator {
                 width: 18px;
                 height: 18px;
@@ -526,9 +643,75 @@ class TodoMainWindow(QMainWindow):
             return self.storage.query(done=True)
         return self.storage.load()
 
+    def _get_date_key(self, timestamp, mode):
+        """
+        根据时间戳和分组模式生成分组键。
+
+        Parameters
+        ----------
+        timestamp : float
+            Unix 时间戳。
+        mode : str
+            分组模式，应为 ``GROUP_BY_DATE`` 或 ``GROUP_BY_MONTH``。
+
+        Returns
+        -------
+        tuple
+            (key, title) 元组，key 用于分组排序，title 用于显示。
+        """
+        dt = datetime.datetime.fromtimestamp(timestamp)
+        today = datetime.date.today()
+        todo_date = dt.date()
+
+        if mode == GROUP_BY_DATE:
+            delta = (today - todo_date).days
+            if delta == 0:
+                return (0, "今天")
+            elif delta == 1:
+                return (1, "昨天")
+            elif delta == 2:
+                return (2, "前天")
+            elif delta < 7:
+                week_days = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+                return (delta, week_days[todo_date.weekday()])
+            else:
+                return (100 + todo_date.toordinal(), "{0}年{1}月{2}日".format(
+                    dt.year, dt.month, dt.day
+                ))
+        elif mode == GROUP_BY_MONTH:
+            return (dt.year * 100 + dt.month, "{0}年{1}月".format(dt.year, dt.month))
+        return (0, "")
+
+    def _group_todos(self, todos):
+        """
+        根据当前分组模式对任务列表进行分组。
+
+        Parameters
+        ----------
+        todos : list of Todo
+            待分组的任务列表。
+
+        Returns
+        -------
+        list of tuples
+            每个元素为 (title, key, todo_list)，按时间倒序排列。
+        """
+        if self.current_group == GROUP_NONE:
+            return [("", 0, todos)]
+
+        groups = {}
+        for todo in todos:
+            key, title = self._get_date_key(todo.created_at, self.current_group)
+            if key not in groups:
+                groups[key] = {"title": title, "todos": []}
+            groups[key]["todos"].append(todo)
+
+        sorted_groups = sorted(groups.items(), key=lambda x: x[0])
+        return [(g["title"], k, g["todos"]) for k, g in sorted_groups]
+
     def _refresh_list(self):
         """
-        根据当前过滤模式刷新列表视图，并更新底部统计信息。
+        根据当前过滤模式和分组模式刷新列表视图，并更新底部统计信息。
 
         Notes
         -----
@@ -537,17 +720,6 @@ class TodoMainWindow(QMainWindow):
         """
         self.list_widget.clear()
         visible = self._filtered_todos()
-        for todo in visible:
-            item = QListWidgetItem(self.list_widget)
-            widget = TodoItemWidget(
-                todo,
-                on_toggle=self._handle_todo_toggled,
-                on_delete=self._handle_todo_deleted,
-                on_update=self._handle_todo_updated,
-            )
-            item.setSizeHint(widget.sizeHint())
-            self.list_widget.addItem(item)
-            self.list_widget.setItemWidget(item, widget)
 
         if not visible:
             empty_item = QListWidgetItem(self.list_widget)
@@ -557,6 +729,29 @@ class TodoMainWindow(QMainWindow):
             empty_item.setSizeHint(empty_label.sizeHint())
             self.list_widget.addItem(empty_item)
             self.list_widget.setItemWidget(empty_item, empty_label)
+            self._update_status_label()
+            return
+
+        grouped = self._group_todos(visible)
+        for title, _, todo_list in grouped:
+            if title:
+                header_item = QListWidgetItem(self.list_widget)
+                header_widget = GroupHeaderWidget(title, len(todo_list))
+                header_item.setSizeHint(header_widget.sizeHint())
+                self.list_widget.addItem(header_item)
+                self.list_widget.setItemWidget(header_item, header_widget)
+
+            for todo in todo_list:
+                item = QListWidgetItem(self.list_widget)
+                widget = TodoItemWidget(
+                    todo,
+                    on_toggle=self._handle_todo_toggled,
+                    on_delete=self._handle_todo_deleted,
+                    on_update=self._handle_todo_updated,
+                )
+                item.setSizeHint(widget.sizeHint())
+                self.list_widget.addItem(item)
+                self.list_widget.setItemWidget(item, widget)
 
         self._update_status_label()
 
@@ -663,6 +858,18 @@ class TodoMainWindow(QMainWindow):
         实际数据查询借助 SQLite 的 ``idx_done_created`` 复合索引完成。
         """
         self.current_filter = mode
+        self._refresh_list()
+
+    def _handle_group_changed(self, mode):
+        """
+        分组模式切换时的回调，刷新列表显示。
+
+        Parameters
+        ----------
+        mode : str
+            新的分组模式，应为 ``GROUP_NONE`` / ``GROUP_BY_DATE`` / ``GROUP_BY_MONTH`` 之一。
+        """
+        self.current_group = mode
         self._refresh_list()
 
     def _handle_export(self):
