@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 数据持久化模块（SQLite）
 负责将任务列表读写到本地 SQLite 数据库，支持按日期与完成状态建立索引，
@@ -10,8 +10,10 @@
 - id         (TEXT, PRIMARY KEY)   UUID 字符串，作为任务唯一标识
 - text       (TEXT, NOT NULL)      任务内容文本
 - done       (INTEGER, NOT NULL)   完成状态，0 表示未完成，1 表示已完成
+- deleted    (INTEGER, NOT NULL)   逻辑删除状态，0 表示正常，1 表示已逻辑删除
 - created_at (REAL, NOT NULL)      创建时间，unix 时间戳（秒级）
 - updated_at (REAL, NOT NULL)      最后更新时间，unix 时间戳（秒级）
+- deleted_at (REAL)                逻辑删除时间，unix 时间戳（秒级）
 
 建立的索引
 ----------
@@ -61,7 +63,7 @@ def _row_to_todo(row):
     Parameters
     ----------
     row : dict or sqlite3.Row
-        包含字段：id, text, done, created_at, updated_at。
+        包含字段：id, text, done, deleted, created_at, updated_at, deleted_at。
 
     Returns
     -------
@@ -74,6 +76,8 @@ def _row_to_todo(row):
         id=row["id"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        deleted=bool(row["deleted"]),
+        deleted_at=row["deleted_at"],
     )
 
 
@@ -100,8 +104,10 @@ class TodoStorage(object):
             id         TEXT PRIMARY KEY,
             text       TEXT NOT NULL,
             done       INTEGER NOT NULL DEFAULT 0,
+            deleted    INTEGER NOT NULL DEFAULT 0,
             created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
+            updated_at REAL NOT NULL,
+            deleted_at REAL
         );
     """
 
@@ -137,6 +143,17 @@ class TodoStorage(object):
         if dir_name and not os.path.isdir(dir_name):
             os.makedirs(dir_name, exist_ok=True)
         with self._connect() as conn:
+            # 检查并添加 deleted 和 deleted_at 列（用于升级现有数据库）
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(todos)")
+            columns = [row[1] for row in cursor.fetchall()]
+            
+            if 'deleted' not in columns:
+                conn.execute("ALTER TABLE todos ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+            if 'deleted_at' not in columns:
+                conn.execute("ALTER TABLE todos ADD COLUMN deleted_at REAL")
+            
+            # 建表和索引
             conn.execute(self._CREATE_TABLE_SQL)
             for sql in self._CREATE_INDEX_SQLS:
                 conn.execute(sql)
@@ -163,7 +180,7 @@ class TodoStorage(object):
 
     def load(self):
         """
-        从数据库加载任务列表，按创建时间倒序排序。
+        从数据库加载任务列表（排除已逻辑删除的），按创建时间倒序排序。
 
         Returns
         -------
@@ -173,8 +190,8 @@ class TodoStorage(object):
         try:
             with self._connect() as conn:
                 rows = conn.execute(
-                    "SELECT id, text, done, created_at, updated_at "
-                    "FROM todos ORDER BY created_at DESC"
+                    "SELECT id, text, done, deleted, created_at, updated_at, deleted_at "
+                    "FROM todos WHERE deleted = 0 ORDER BY created_at DESC"
                 ).fetchall()
             return [_row_to_todo(r) for r in rows]
         except sqlite3.Error as exc:
@@ -183,7 +200,7 @@ class TodoStorage(object):
 
     def query(self, done=None, start_ts=None, end_ts=None):
         """
-        按完成状态与日期时间范围查询任务。
+        按完成状态与日期时间范围查询任务（排除已逻辑删除的）。
 
         这是索引（``idx_done`` / ``idx_created_at`` / ``idx_done_created``）
         真正发挥作用的查询入口，外部调用者可用它做各种筛选展示。
@@ -202,7 +219,7 @@ class TodoStorage(object):
         list of Todo
             满足条件的任务对象列表，按创建时间倒序排列。
         """
-        clauses = []
+        clauses = ["deleted = 0"]
         params = []
         if done is not None:
             clauses.append("done = ?")
@@ -215,9 +232,8 @@ class TodoStorage(object):
             params.append(float(end_ts))
 
         sql = (
-            "SELECT id, text, done, created_at, updated_at FROM todos"
-            + (" WHERE " + " AND ".join(clauses) if clauses else "")
-            + " ORDER BY created_at DESC"
+            "SELECT id, text, done, deleted, created_at, updated_at, deleted_at FROM todos "
+            "WHERE " + " AND ".join(clauses) + " ORDER BY created_at DESC"
         )
         try:
             with self._connect() as conn:
@@ -244,14 +260,16 @@ class TodoStorage(object):
         try:
             with self._connect() as conn:
                 conn.execute(
-                    "INSERT INTO todos (id, text, done, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO todos (id, text, done, deleted, created_at, updated_at, deleted_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         todo.id,
                         todo.text,
                         1 if todo.done else 0,
+                        1 if todo.deleted else 0,
                         todo.created_at,
                         todo.updated_at,
+                        todo.deleted_at,
                     ),
                 )
             return True
@@ -311,7 +329,7 @@ class TodoStorage(object):
 
     def delete_todo(self, todo):
         """
-        从数据库中删除指定任务。
+        对任务进行逻辑删除（不是物理删除）。
 
         Parameters
         ----------
@@ -324,28 +342,103 @@ class TodoStorage(object):
             成功返回 True，失败返回 False。
         """
         try:
+            now = __import__('time').time()
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE todos SET deleted = 1, deleted_at = ?, updated_at = ? WHERE id = ?",
+                    (now, now, todo.id),
+                )
+            return True
+        except sqlite3.Error as exc:
+            print("逻辑删除任务失败：{0}".format(exc))
+            return False
+
+    def hard_delete_todo(self, todo):
+        """
+        对任务进行物理删除（从数据库中永久移除）。
+
+        Parameters
+        ----------
+        todo : Todo
+            要物理删除的任务对象（以 ``id`` 作为删除依据）。
+
+        Returns
+        -------
+        bool
+            成功返回 True，失败返回 False。
+        """
+        try:
             with self._connect() as conn:
                 conn.execute("DELETE FROM todos WHERE id = ?", (todo.id,))
             return True
         except sqlite3.Error as exc:
-            print("删除任务失败：{0}".format(exc))
+            print("物理删除任务失败：{0}".format(exc))
             return False
 
-    def clear_done(self):
+    def clear_done(self, before_ts=None):
         """
-        清除所有已完成的任务。
+        对已完成的任务进行逻辑删除，可选指定日期时间。
+
+        Parameters
+        ----------
+        before_ts : float, optional
+            若指定，则只清除该时间戳之前创建的已完成任务。
+            若不指定，则清除所有已完成任务。
 
         Returns
         -------
         int
-            实际删除的任务条数；若出错则返回 0。
+            实际逻辑删除的任务条数；若出错则返回 0。
+        """
+        try:
+            now = __import__('time').time()
+            with self._connect() as conn:
+                if before_ts is not None:
+                    cur = conn.execute(
+                        "UPDATE todos SET deleted = 1, deleted_at = ?, updated_at = ? "
+                        "WHERE done = 1 AND created_at <= ?",
+                        (now, now, before_ts),
+                    )
+                else:
+                    cur = conn.execute(
+                        "UPDATE todos SET deleted = 1, deleted_at = ?, updated_at = ? "
+                        "WHERE done = 1",
+                        (now, now),
+                    )
+                return cur.rowcount if cur.rowcount else 0
+        except sqlite3.Error as exc:
+            print("逻辑清除已完成任务失败：{0}".format(exc))
+            return 0
+
+    def hard_clear_done(self, before_ts=None):
+        """
+        对已完成的任务进行物理删除（永久移除），可选指定日期时间。
+
+        Parameters
+        ----------
+        before_ts : float, optional
+            若指定，则只物理删除该时间戳之前创建的已完成任务。
+            若不指定，则物理删除所有已完成任务。
+
+        Returns
+        -------
+        int
+            实际物理删除的任务条数；若出错则返回 0。
         """
         try:
             with self._connect() as conn:
-                cur = conn.execute("DELETE FROM todos WHERE done = 1")
+                if before_ts is not None:
+                    cur = conn.execute(
+                        "DELETE FROM todos WHERE done = 1 AND created_at <= ?",
+                        (before_ts,),
+                    )
+                else:
+                    cur = conn.execute(
+                        "DELETE FROM todos WHERE done = 1"
+                    )
                 return cur.rowcount if cur.rowcount else 0
         except sqlite3.Error as exc:
-            print("清除已完成任务失败：{0}".format(exc))
+            print("物理清除已完成任务失败：{0}".format(exc))
             return 0
 
     # ------------------------------------------------------------------
@@ -354,7 +447,7 @@ class TodoStorage(object):
 
     def count_stats(self):
         """
-        返回任务整体统计信息：总数 / 未完成数 / 已完成数。
+        返回任务整体统计信息（排除已逻辑删除的）：总数 / 未完成数 / 已完成数。
 
         Returns
         -------
@@ -368,7 +461,7 @@ class TodoStorage(object):
                     "COUNT(*) AS total, "
                     "SUM(CASE WHEN done = 0 THEN 1 ELSE 0 END) AS active, "
                     "SUM(CASE WHEN done = 1 THEN 1 ELSE 0 END) AS done "
-                    "FROM todos"
+                    "FROM todos WHERE deleted = 0"
                 ).fetchone()
             total = row["total"] if row else 0
             active = row["active"] if row and row["active"] is not None else 0
@@ -378,13 +471,38 @@ class TodoStorage(object):
             print("查询任务统计失败：{0}".format(exc))
             return {"total": 0, "active": 0, "done": 0}
 
+    def count_done_before(self, before_ts):
+        """
+        统计指定时间之前创建的已完成任务数量。
+
+        Parameters
+        ----------
+        before_ts : float
+            指定的时间戳。
+
+        Returns
+        -------
+        int
+            指定时间前的已完成任务数（排除已逻辑删除的）。
+        """
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM todos WHERE done = 1 AND deleted = 0 AND created_at <= ?",
+                    (before_ts,),
+                ).fetchone()
+            return row["cnt"] if row and row["cnt"] is not None else 0
+        except sqlite3.Error as exc:
+            print("查询任务统计失败：{0}".format(exc))
+            return 0
+
     # ------------------------------------------------------------------
     # 导出功能
     # ------------------------------------------------------------------
 
     def export_to_csv(self, file_path):
         """
-        将当前所有任务导出为 CSV 文件。
+        将当前所有任务导出为 CSV 文件（排除已逻辑删除的）。
 
         CSV 列顺序与表头：序号, 状态, 内容, 创建时间, 最后更新时间。
         默认使用 UTF-8 + BOM 编码，保证 Excel 打开不乱码。
@@ -429,7 +547,7 @@ class TodoStorage(object):
 
     def export_to_text(self, file_path):
         """
-        将当前所有任务导出为纯文本清单，采用更直观的人类可读格式。
+        将当前所有任务导出为纯文本清单（排除已逻辑删除的），采用更直观的人类可读格式。
 
         文本包含整体统计信息以及每条任务的状态标记与时间信息。
 
@@ -516,14 +634,16 @@ class TodoStorage(object):
                 conn.execute("DELETE FROM todos")
                 for todo in todos:
                     conn.execute(
-                        "INSERT INTO todos (id, text, done, created_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO todos (id, text, done, deleted, created_at, updated_at, deleted_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (
                             todo.id,
                             todo.text,
                             1 if todo.done else 0,
+                            1 if todo.deleted else 0,
                             todo.created_at,
                             todo.updated_at,
+                            todo.deleted_at,
                         ),
                     )
             return True

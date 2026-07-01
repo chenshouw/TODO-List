@@ -4,8 +4,8 @@
 使用 PyQt5 构建 TODO-List 桌面控件，提供简洁美观的交互界面。
 """
 
-from PyQt5.QtCore import Qt, QSize
-from PyQt5.QtGui import QIcon, QKeySequence, QFont
+from PyQt5.QtCore import Qt, QSize, QDate
+from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -20,13 +20,17 @@ from PyQt5.QtWidgets import (
     QLabel,
     QFrame,
     QButtonGroup,
-    QScrollArea,
     QMessageBox,
     QFileDialog,
     QSizePolicy,
+    QDialog,
+    QDateEdit,
+    QFormLayout,
+    QSpinBox,
 )
 import datetime
 import os
+import random
 
 from .models import Todo
 from .storage import TodoStorage
@@ -58,7 +62,7 @@ class TodoItemWidget(QFrame):
         todo : Todo
             任务对象，用于渲染当前控件的状态。
         on_toggle : callable, optional
-            复选框状态切换时的回调，签名为 ``on_toggle(todo)``。
+            复选框状态变化时的回调，签名为 ``on_toggle(todo)``。
         on_delete : callable, optional
             删除按钮点击时的回调，签名为 ``on_delete(todo)``。
         on_update : callable, optional
@@ -113,7 +117,7 @@ class TodoItemWidget(QFrame):
 
         # 删除按钮
         self.delete_btn = QPushButton("✕")
-        self.delete_btn.setToolTip("删除该任务")
+        self.delete_btn.setToolTip("删除该任务（逻辑删除）")
         self.delete_btn.setCursor(Qt.PointingHandCursor)
         self.delete_btn.setFixedSize(QSize(28, 28))
         self.delete_btn.setStyleSheet(
@@ -248,6 +252,219 @@ class GroupHeaderWidget(QFrame):
         root_layout.addWidget(self.count_label, 0)
 
 
+class ClearDoneDialog(QDialog):
+    """
+    清除已完成任务的对话框，支持日期选择和随机数验证。
+    """
+
+    def __init__(self, storage, parent=None):
+        """
+        初始化对话框。
+
+        Parameters
+        ----------
+        storage : TodoStorage
+            数据存储实例，用于查询任务数量。
+        parent : QWidget, optional
+            父窗口对象。
+        """
+        super(ClearDoneDialog, self).__init__(parent)
+        self.storage = storage
+        self.random_code = self._generate_random_code()
+        self._build_ui()
+        self._apply_style()
+
+    def _generate_random_code(self):
+        """生成4位随机数"""
+        return "{:04d}".format(random.randint(0, 9999))
+
+    def _build_ui(self):
+        self.setWindowTitle("清除已完成任务")
+        self.setMinimumWidth(400)
+
+        layout = QVBoxLayout(self)
+
+        # 日期选择
+        self.use_date_check = QCheckBox("只清除指定日期之前的任务")
+        self.use_date_check.setChecked(False)
+        self.use_date_check.toggled.connect(self._toggle_date_edit)
+
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDate(QDate.currentDate())
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_edit.setEnabled(False)
+
+        form_layout = QFormLayout()
+        form_layout.addRow(self.use_date_check, self.date_edit)
+        layout.addLayout(form_layout)
+
+        # 随机数验证
+        code_label = QLabel("请输入以下4位随机数以确认操作：")
+        self.code_display = QLabel(self.random_code)
+        self.code_display.setStyleSheet("font-size: 24px; font-weight: bold; color: #5e60ce; padding: 10px; background-color: #f7f7fb; border-radius: 6px;")
+        self.code_input = QLineEdit()
+        self.code_input.setPlaceholderText("请输入4位随机数")
+
+        code_input_layout = QFormLayout()
+        code_input_layout.addRow(code_label, self.code_display)
+        code_input_layout.addRow("验证数字：", self.code_input)
+        layout.addLayout(code_input_layout)
+
+        # 按钮
+        btn_layout = QHBoxLayout()
+        self.ok_btn = QPushButton("确定清除")
+        self.ok_btn.setStyleSheet("background-color: #e74c3c; color: white; padding: 8px 20px; font-weight: bold;")
+        self.ok_btn.clicked.connect(self._on_ok_clicked)
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def _apply_style(self):
+        self.setStyleSheet(
+            """
+            QPushButton {
+                padding: 8px 16px;
+                border-radius: 6px;
+            }
+            """
+        )
+
+    def _toggle_date_edit(self, checked):
+        self.date_edit.setEnabled(checked)
+
+    def _on_ok_clicked(self):
+        input_code = self.code_input.text().strip()
+        if input_code != self.random_code:
+            QMessageBox.warning(self, "验证失败", "输入的随机数不正确！")
+            self.random_code = self._generate_random_code()
+            self.code_display.setText(self.random_code)
+            self.code_input.clear()
+            return
+
+        self.accept()
+
+    def get_before_timestamp(self):
+        """
+        获取用户选择的日期对应的时间戳（当天结束时）。
+
+        Returns
+        -------
+        float or None
+            若启用了日期选择，返回该日期23:59:59的时间戳；否则返回None。
+        """
+        if not self.use_date_check.isChecked():
+            return None
+
+        qdate = self.date_edit.date()
+        # 设置为当天的23:59:59
+        dt = datetime.datetime(qdate.year(), qdate.month(), qdate.day(), 23, 59, 59)
+        return dt.timestamp()
+
+
+class DeleteTodoDialog(QDialog):
+    """
+    删除单个任务的对话框，支持逻辑删除和物理删除选项。
+    """
+
+    # 返回值常量
+    RESULT_LOGICAL_DELETE = 1
+    RESULT_HARD_DELETE = 2
+
+    def __init__(self, todo_text, parent=None):
+        """
+        初始化对话框。
+
+        Parameters
+        ----------
+        todo_text : str
+            要删除的任务文本内容。
+        parent : QWidget, optional
+            父窗口对象。
+        """
+        super(DeleteTodoDialog, self).__init__(parent)
+        self.todo_text = todo_text
+        self.random_code = self._generate_random_code()
+        self._build_ui()
+
+    def _generate_random_code(self):
+        return "{:04d}".format(random.randint(0, 9999))
+
+    def _build_ui(self):
+        self.setWindowTitle("删除任务")
+        self.setMinimumWidth(400)
+
+        layout = QVBoxLayout(self)
+
+        # 任务信息
+        info_label = QLabel("您即将删除以下任务：")
+        task_label = QLabel(self.todo_text)
+        task_label.setStyleSheet("font-weight: bold; padding: 10px; background-color: #fff3cd; border-radius: 6px; color: #856404;")
+        layout.addWidget(info_label)
+        layout.addWidget(task_label)
+        layout.addSpacing(10)
+
+        # 选项
+        self.hard_delete_check = QCheckBox("永久删除（物理删除，不可恢复）")
+        self.hard_delete_check.setChecked(False)
+        self.hard_delete_check.toggled.connect(self._toggle_hard_delete)
+        layout.addWidget(self.hard_delete_check)
+
+        # 随机数验证
+        code_label = QLabel("请输入以下4位随机数以确认操作：")
+        self.code_display = QLabel(self.random_code)
+        self.code_display.setStyleSheet("font-size: 24px; font-weight: bold; color: #5e60ce; padding: 10px; background-color: #f7f7fb; border-radius: 6px;")
+        self.code_input = QLineEdit()
+        self.code_input.setPlaceholderText("请输入4位随机数")
+
+        code_input_layout = QFormLayout()
+        code_input_layout.addRow(code_label, self.code_display)
+        code_input_layout.addRow("验证数字：", self.code_input)
+        layout.addLayout(code_input_layout)
+
+        # 按钮
+        btn_layout = QHBoxLayout()
+        self.logical_btn = QPushButton("逻辑删除")
+        self.logical_btn.clicked.connect(lambda: self._on_delete_clicked(self.RESULT_LOGICAL_DELETE))
+        
+        self.hard_btn = QPushButton("永久删除")
+        self.hard_btn.clicked.connect(lambda: self._on_delete_clicked(self.RESULT_HARD_DELETE))
+        self.hard_btn.setEnabled(False)
+        self.hard_btn.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold;")
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.logical_btn)
+        btn_layout.addWidget(self.hard_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def _toggle_hard_delete(self, checked):
+        self.hard_btn.setEnabled(checked)
+        if checked:
+            self.logical_btn.setEnabled(False)
+        else:
+            self.logical_btn.setEnabled(True)
+
+    def _on_delete_clicked(self, result_code):
+        input_code = self.code_input.text().strip()
+        if input_code != self.random_code:
+            QMessageBox.warning(self, "验证失败", "输入的随机数不正确！")
+            self.random_code = self._generate_random_code()
+            self.code_display.setText(self.random_code)
+            self.code_input.clear()
+            return
+
+        self.done(result_code)
+
+
 class TodoMainWindow(QMainWindow):
     """
     TODO-List 主窗口。
@@ -263,7 +480,7 @@ class TodoMainWindow(QMainWindow):
         Parameters
         ----------
         storage : TodoStorage, optional
-            数据存储实例，如不提供将使用默认路径创建新实例。
+            数据存储实例，如不指定则使用默认路径创建新实例。
         """
         super(TodoMainWindow, self).__init__()
         self.storage = storage if storage else TodoStorage()
@@ -292,7 +509,7 @@ class TodoMainWindow(QMainWindow):
         - 顶部：输入框 + 添加按钮
         - 中部：过滤切换按钮组
         - 主体：任务列表（可滚动）
-        - 底部：状态统计 + 清除已完成按钮
+        - 底部：状态统计 + 导出清单按钮 + 清除按钮
         """
         central = QWidget()
         self.setCentralWidget(central)
@@ -343,7 +560,7 @@ class TodoMainWindow(QMainWindow):
         filter_container.addWidget(self.btn_active)
         filter_container.addWidget(self.btn_done)
 
-        filter_container.addStretch(1)
+        filter_container.addStretch()
 
         # 分组切换按钮
         self.group_group = QButtonGroup(self)
@@ -388,7 +605,7 @@ class TodoMainWindow(QMainWindow):
         )
         layout.addWidget(self.list_widget, 1)
 
-        # 底部：状态统计 + 导出按钮 + 清除按钮
+        # 底部：状态统计 + 导出清单按钮 + 清除按钮
         bottom_container = QHBoxLayout()
 
         self.status_label = QLabel("共 0 项")
@@ -444,7 +661,7 @@ class TodoMainWindow(QMainWindow):
 
     def _create_filter_button(self, text, mode, checked=False):
         """
-        创建过滤切换按钮，并加入到按钮组中。
+        创建过滤切换按钮，并加入按钮组中。
 
         Parameters
         ----------
@@ -472,7 +689,7 @@ class TodoMainWindow(QMainWindow):
 
     def _create_group_button(self, text, mode, checked=False):
         """
-        创建分组切换按钮，并加入到按钮组中。
+        创建分组切换按钮，并加入按钮组中。
 
         Parameters
         ----------
@@ -599,9 +816,6 @@ class TodoMainWindow(QMainWindow):
                 border: 2px solid #5e60ce;
                 image: none;
             }
-            QCheckBox::indicator:checked::after {
-                /* 使用样式中的勾选标记由 Qt 绘制 */
-            }
             """
         )
 
@@ -611,19 +825,13 @@ class TodoMainWindow(QMainWindow):
 
     def _load_todos(self):
         """
-        从持久化存储中读取任务列表。
+        从持久化存储中加载任务列表。
 
         Notes
         -----
         读取失败时不会抛出异常，而是以空列表继续运行，保证应用可用性。
         """
         self.todos = self.storage.load()
-
-    def _persist(self):
-        """
-        将当前任务列表保存到持久化存储。
-        """
-        self.storage.save(self.todos)
 
     def _filtered_todos(self):
         """
@@ -675,9 +883,7 @@ class TodoMainWindow(QMainWindow):
                 week_days = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
                 return (delta, week_days[todo_date.weekday()])
             else:
-                return (100 + todo_date.toordinal(), "{0}年{1}月{2}日".format(
-                    dt.year, dt.month, dt.day
-                ))
+                return (100 + todo_date.toordinal(), "{0}年{1}月{2}日".format(dt.year, dt.month, dt.day))
         elif mode == GROUP_BY_MONTH:
             return (dt.year * 100 + dt.month, "{0}年{1}月".format(dt.year, dt.month))
         return (0, "")
@@ -797,7 +1003,6 @@ class TodoMainWindow(QMainWindow):
             self.input_edit.setFocus()
             return
         new_todo = Todo(text=text)
-        # 持久化到数据库，成功后再加入内存列表，避免出现“数据库失败但内存有”的不一致
         if self.storage.add_todo(new_todo):
             self.todos.insert(0, new_todo)
         self.input_edit.clear()
@@ -817,19 +1022,32 @@ class TodoMainWindow(QMainWindow):
 
     def _handle_todo_deleted(self, todo):
         """
-        任务删除时的回调：从数据库与内存列表中移除对应任务。
+        任务删除时的回调：显示确认对话框，根据用户选择执行逻辑/物理删除。
 
         Parameters
         ----------
         todo : Todo
             要删除的任务对象。
         """
-        self.storage.delete_todo(todo)
-        try:
-            self.todos.remove(todo)
-        except ValueError:
-            pass
-        self._refresh_list()
+        dialog = DeleteTodoDialog(todo.text[:50] + ("..." if len(todo.text) > 50 else ""), self)
+        result = dialog.exec_()
+
+        if result == DeleteTodoDialog.RESULT_LOGICAL_DELETE:
+            if self.storage.delete_todo(todo):
+                try:
+                    self.todos.remove(todo)
+                except ValueError:
+                    pass
+                self._refresh_list()
+                QMessageBox.information(self, "删除成功", "任务已逻辑删除！")
+        elif result == DeleteTodoDialog.RESULT_HARD_DELETE:
+            if self.storage.hard_delete_todo(todo):
+                try:
+                    self.todos.remove(todo)
+                except ValueError:
+                    pass
+                self._refresh_list()
+                QMessageBox.information(self, "删除成功", "任务已永久删除！")
 
     def _handle_todo_updated(self, todo, new_text):
         """
@@ -881,20 +1099,22 @@ class TodoMainWindow(QMainWindow):
         if stats["total"] == 0:
             QMessageBox.information(self, "提示", "当前没有任务可导出。")
             return
-        # 默认文件名：待办清单_YYYYMMDD_HHMMSS
+
         default_name = "待办清单_{0}".format(datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
         default_dir = os.path.join(os.path.expanduser("~"), "Documents")
         if not os.path.isdir(default_dir):
             default_dir = os.path.expanduser("~")
+
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "导出待办清单",
             os.path.join(default_dir, default_name + ".csv"),
             "CSV 表格 (*.csv);;文本文件 (*.txt);;所有文件 (*.*)",
         )
+
         if not file_path:
             return
-        # 根据扩展名选择导出方式；无扩展名默认使用 CSV
+
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".csv":
             count = self.storage.export_to_csv(file_path)
@@ -903,40 +1123,50 @@ class TodoMainWindow(QMainWindow):
             count = self.storage.export_to_text(file_path)
             fmt = "文本文件"
         else:
-            # 未指定扩展名或不支持：默认追加 .csv 并按 CSV 导出
             file_path = file_path + ".csv"
             count = self.storage.export_to_csv(file_path)
             fmt = "CSV 表格"
+
         if count > 0:
             QMessageBox.information(
                 self, "导出成功", "已成功导出 {0} 项 ({1})：\n\n{2}".format(count, fmt, file_path)
             )
         elif count == 0 and os.path.isfile(file_path):
-            # 清单为空但已成功写出空文件（仅表头/提示）
             QMessageBox.information(self, "导出成功", "当前清单为空，已导出 {0}：\n\n{1}".format(fmt, file_path))
         else:
             QMessageBox.warning(self, "导出失败", "导出文件时出现问题，请检查路径是否有权限写入。")
 
     def _handle_clear_done(self):
         """
-        清除所有已完成的任务，在真正删除前会进行确认弹窗提示。
+        清除已完成任务的处理：显示对话框，根据用户选择执行逻辑删除。
         """
         stats = self.storage.count_stats()
         done_count = stats["done"]
         if done_count == 0:
             QMessageBox.information(self, "提示", "当前没有已完成的任务可清除。")
             return
-        reply = QMessageBox.question(
-            self,
-            "确认清除",
-            "确定要清除 {0} 项已完成任务？此操作不可撤销。".format(done_count),
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if reply == QMessageBox.Yes:
-            self.storage.clear_done()
+
+        dialog = ClearDoneDialog(self.storage, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        before_ts = dialog.get_before_timestamp()
+        if before_ts is not None:
+            count = self.storage.count_done_before(before_ts)
+            if count == 0:
+                QMessageBox.information(self, "提示", "该日期之前没有已完成的任务。")
+                return
+        else:
+            count = done_count
+
+        deleted = self.storage.clear_done(before_ts)
+        if before_ts is None:
             self.todos = [t for t in self.todos if not t.done]
-            self._refresh_list()
+        else:
+            self.todos = [t for t in self.todos if (not t.done) or (t.created_at > before_ts)]
+
+        self._refresh_list()
+        QMessageBox.information(self, "清除成功", "已成功逻辑删除 {0} 条任务！".format(deleted))
 
 
 def run_app():
@@ -944,7 +1174,6 @@ def run_app():
     启动 TODO-List 应用程序的顶层入口。
 
     该函数会创建 QApplication 与主窗口，并进入事件循环。
-    在脚本直接运行或被外部调用时都可直接使用。
 
     Returns
     -------
@@ -952,9 +1181,7 @@ def run_app():
         Qt 应用退出码，通常 ``0`` 表示正常退出。
     """
     import sys
-
     app = QApplication(sys.argv)
-    # 设置字体以获得更好的中文字体表现
     font = app.font()
     font.setPointSize(10)
     app.setFont(font)
